@@ -26,17 +26,18 @@ class DateTimeEncoder(json.JSONEncoder):
             return obj.strftime("%Y-%m-%dT%H:%M:%SZ")
         return super(DateTimeEncoder, self).default(obj)
 
-def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns='', url_columns=''):
+def sync_stream_to_batch(conn, project_key, source_stream, id_column, date_columns='', url_columns='', api_credentials_table='BATCH_API_CREDENTIALS'):
     """
-    Sync a Snowflake table to Batch.com
+    Sync a Snowflake stream to Batch.com
     
     Args:
         conn: Snowflake connection
         project_key (str): Batch project key
-        source_table (str): Name of the source table
+        source_stream (str): Name of the source stream
         id_column (str): Column to use as the customer ID
         date_columns (str): Comma-separated list of date columns
         url_columns (str): Comma-separated list of URL columns
+        api_credentials_table (str): Name of the table containing API credentials
     
     Returns:
         str: Result message
@@ -50,7 +51,7 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
         
         # Retrieve API credentials
         logger.info(f"Retrieving API credentials for project key: {project_key}")
-        cursor.execute(f"SELECT * FROM BATCH_API_CREDENTIALS WHERE project_key = '{project_key}'")
+        cursor.execute(f"SELECT * FROM {api_credentials_table} WHERE project_key = '{project_key}'")
         creds = cursor.fetchone()
         if not creds:
             error_msg = f"No API credentials found for project key: {project_key}"
@@ -70,41 +71,83 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
         rest_api_key = creds[rest_api_key_idx]
         api_url = "https://api.batch.com/2.4/profiles/update"
         
-        # Validate the table exists and is accessible
+        # Begin a transaction for stream consumption
+        cursor.execute("BEGIN TRANSACTION")
+        
         try:
-            # Get columns dynamically from the source table
-            logger.info(f"Validating table: {source_table}")
-            table_schema = source_table.split('.')[-2]
-            table_name = source_table.split('.')[-1]
-            cursor.execute(f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'")
-            columns = cursor.fetchall()
-            column_names = [row[0] for row in columns]
+            # Get column information by directly querying the stream
+            logger.info(f"Extracting columns directly from stream: {source_stream}")
             
-            if id_column.upper() not in [col.upper() for col in column_names]:
-                error_msg = f"Error: ID column '{id_column}' not found in table '{source_table}'"
+            # Try to get a sample row to extract column names
+            cursor.execute(f"SELECT * FROM {source_stream} LIMIT 1")
+            sample_row = cursor.fetchone()
+            
+            if not sample_row:
+                # No data in stream, commit to mark the position and exit
+                cursor.execute("COMMIT")
+                message = f"No data found in stream {source_stream}."
+                logger.info(message)
+                return message
+            
+            # Extract column names from cursor description
+            column_names = [desc[0] for desc in cursor.description if not desc[0].startswith('METADATA$')]
+            
+            if not column_names:
+                error_msg = f"No non-metadata columns found in stream {source_stream}"
                 logger.error(error_msg)
+                cursor.execute("ROLLBACK")
                 return error_msg
-                
-            # Build the dynamic SQL query with all columns
-            columns_str = ', '.join(column_names)
-            query = f"SELECT {columns_str} FROM {source_table}"
             
-            # Fetch data from the source table
-            logger.info(f"Fetching data from {source_table}")
+            logger.info(f"Found {len(column_names)} columns in stream: {column_names}")
+            
+            # Verify the ID column exists (case-insensitive search)
+            id_column_found = False
+            for col in column_names:
+                if col.upper() == id_column.upper():
+                    id_column = col  # Use the exact case from the stream
+                    id_column_found = True
+                    break
+            
+            if not id_column_found:
+                error_msg = f"Error: ID column '{id_column}' not found in stream columns: {column_names}"
+                logger.error(error_msg)
+                cursor.execute("ROLLBACK")
+                return error_msg
+            
+            # Build the dynamic SQL query with all columns plus stream metadata
+            # Quote the column names to handle case sensitivity and special characters
+            columns_str = ', '.join([f'"{col}"' for col in column_names])
+            query = f"""
+                SELECT {columns_str}, 
+                       METADATA$ACTION, 
+                       METADATA$ISUPDATE,
+                       METADATA$ROW_ID
+                FROM {source_stream}
+            """
+            
+            # Fetch data from the stream
+            logger.info(f"Fetching changes from stream {source_stream}")
             cursor.execute(query)
             rows = cursor.fetchall()
             
+            # Get all column names including metadata
+            all_columns = column_names + ["METADATA$ACTION", "METADATA$ISUPDATE", "METADATA$ROW_ID"]
+            
             # Convert to pandas DataFrame for easier processing
-            user_df = pd.DataFrame(rows, columns=[desc[0] for desc in cursor.description])
+            changes_df = pd.DataFrame(rows, columns=all_columns)
+            
+            if changes_df.empty:
+                # Commit the transaction to mark the current stream position
+                cursor.execute("COMMIT")
+                message = f"No rows found in stream {source_stream} despite having schema."
+                logger.info(message)
+                return message
+                
         except Exception as e:
-            error_msg = f"Error accessing table {source_table}: {str(e)}"
+            error_msg = f"Error accessing stream {source_stream}: {str(e)}"
             logger.error(error_msg)
+            cursor.execute("ROLLBACK")
             return error_msg
-        
-        if user_df.empty:
-            message = f"No rows found in {source_table}."
-            logger.info(message)
-            return message
         
         headers = {
             "Content-Type": "application/json",
@@ -118,25 +161,35 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
         user_data_batch = []
         
         # Process each row in the dataframe
-        logger.info(f"Processing {len(user_df)} rows from {source_table}")
-        for index, row in user_df.iterrows():
+        logger.info(f"Processing {len(changes_df)} change records from {source_stream}")
+        for index, row in changes_df.iterrows():
             try:
+                # Get the action type (INSERT, UPDATE, or DELETE)
+                action = row["METADATA$ACTION"]
+                
+                # Skip deleted records as Batch doesn't support deletion
+                if action == "DELETE":
+                    logger.debug(f"Skipping DELETE action for row {index}")
+                    continue
+                
                 custom_id = str(row[id_column])
                 
                 # Process attributes with proper data typing
                 attributes = {}
                 
                 for col_name, value in row.items():
-                    if col_name == id_column:
-                        continue  # Skip the ID column as it's used for identification
+                    # Skip metadata columns and ID column
+                    if col_name in ["METADATA$ACTION", "METADATA$ISUPDATE", "METADATA$ROW_ID"] or col_name == id_column:
+                        continue
                     
                     if pd.isna(value):
                         continue  # Skip None/NaN values
                     
-                    # Convert column name to lowercase for consistency
+                    # Convert column name to lowercase for consistency in Batch
                     attr_name = col_name.lower()
-                        
+                    
                     # Process based on field type, with appropriate attribute name wrapping
+                    # Use case-insensitive matching for date and URL columns
                     if col_name.upper() in date_columns_set:
                         # Use date() wrapper for date field names
                         attributes[f"date({attr_name})"] = value
@@ -154,7 +207,7 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
                     "attributes": attributes
                 })
                 
-                if len(user_data_batch) == 1000 or index == len(user_df) - 1:
+                if len(user_data_batch) == 1000 or index == len(changes_df) - 1:
                     try:
                         # Use the custom encoder to handle date objects
                         json_data = json.dumps(user_data_batch, cls=DateTimeEncoder)
@@ -182,8 +235,17 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
                 logger.error(error_msg)
                 error_logs.append(error_msg)
         
+        # If everything was successful, commit the transaction to mark the stream as consumed
+        if fail_count == 0:
+            logger.info("All records processed successfully, committing transaction to consume stream data")
+            cursor.execute("COMMIT")
+        else:
+            # If there were any failures, roll back so we can retry
+            logger.warning(f"{fail_count} records failed processing, rolling back transaction")
+            cursor.execute("ROLLBACK")
+        
         # Save results to a log table if desired
-        result_message = f"Table sync complete for {source_table}: {success_count} records succeeded, {fail_count} failed."
+        result_message = f"Stream sync complete for {source_stream}: {success_count} records succeeded, {fail_count} failed."
         logger.info(result_message)
         
         if error_logs:
@@ -193,18 +255,24 @@ def sync_table_to_batch(conn, project_key, source_table, id_column, date_columns
             
         return result_message
     except Exception as e:
-        error_msg = f"Error in sync_table_to_batch: {str(e)}"
+        error_msg = f"Error in sync_stream_to_batch: {str(e)}"
         logger.error(error_msg)
+        try:
+            cursor.execute("ROLLBACK")
+            logger.info("Transaction rolled back due to error")
+        except:
+            pass
         return error_msg
 
 def parse_arguments():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Sync Snowflake table to Batch.com')
+    parser = argparse.ArgumentParser(description='Sync Snowflake stream to Batch.com')
     parser.add_argument('--project-key', required=True, help='Batch project key')
-    parser.add_argument('--source-table', required=True, help='Source table name (format: DATABASE.SCHEMA.TABLE)')
+    parser.add_argument('--source-stream', required=True, help='Source stream name (format: DATABASE.SCHEMA.STREAM)')
     parser.add_argument('--id-column', required=True, help='Column to use as the custom ID')
     parser.add_argument('--date-columns', default='', help='Comma-separated list of date columns')
     parser.add_argument('--url-columns', default='', help='Comma-separated list of URL columns')
+    parser.add_argument('--api-credentials-table', default='BATCH_API_CREDENTIALS', help='Table containing API credentials')
     parser.add_argument('--connection-parameters', default='', help='JSON string of connection parameters')
     return parser.parse_args()
 
@@ -280,14 +348,15 @@ def main():
         conn = session._conn._conn
         
         # Call the sync function
-        logger.info("Starting table sync process")
-        result = sync_table_to_batch(
+        logger.info("Starting stream sync process")
+        result = sync_stream_to_batch(
             conn,
             args.project_key,
-            args.source_table,
+            args.source_stream,
             args.id_column,
             args.date_columns,
-            args.url_columns
+            args.url_columns,
+            args.api_credentials_table
         )
         
         logger.info(f"Final result: {result}")
