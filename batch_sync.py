@@ -276,9 +276,47 @@ def parse_arguments():
     parser.add_argument('--connection-parameters', default='', help='JSON string of connection parameters')
     return parser.parse_args()
 
+def get_login_token():
+    """
+    Read the login token supplied automatically by Snowflake. These tokens
+    are short lived and should always be read right before creating any new connection.
+    """
+    with open("/snowflake/session/token", "r") as f:
+        return f.read()
+
+def get_connection_params():
+    """
+    Construct Snowflake connection params from environment variables.
+    """
+    if os.path.exists("/snowflake/session/token"):
+        return {
+            "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
+            "host": os.environ.get("SNOWFLAKE_HOST"),
+            "authenticator": "oauth",
+            "token": get_login_token(),
+            "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE"),
+            "database": os.environ.get("SNOWFLAKE_DATABASE"),
+            "schema": os.environ.get("SNOWFLAKE_SCHEMA"),
+            "role": os.environ.get("SNOWFLAKE_ROLE"),
+            "application": "BATCH_CONNECTOR"
+        }
+    else:
+        # Fallback to user/password if not in container environment
+        return {
+            "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
+            "host": os.environ.get("SNOWFLAKE_HOST"),
+            "user": os.environ.get("SNOWFLAKE_USER"),
+            "password": os.environ.get("SNOWFLAKE_PASSWORD"),
+            "role": os.environ.get("SNOWFLAKE_ROLE"),
+            "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE"),
+            "database": os.environ.get("SNOWFLAKE_DATABASE"),
+            "schema": os.environ.get("SNOWFLAKE_SCHEMA"),
+            "application": "BATCH_CONNECTOR"
+        }
+
 def create_session(connection_params=None):
     """
-    Create a Snowpark session using either connection parameters or environment variables
+    Create a Snowpark session using Snowflake-provided connection parameters
     
     Args:
         connection_params (dict, optional): Connection parameters as a dictionary
@@ -292,44 +330,10 @@ def create_session(connection_params=None):
             logger.info("Creating session using provided connection parameters")
             return Session.builder.configs(connection_params).create()
         
-        # For Snowpark Container Services, first check if we're running in a container environment
-        # with default connection parameters
-        logger.info("Checking for Snowflake connection method")
-        
-        # In a Container Service, we might be able to use getConnection() which 
-        # automatically uses the container's credentials
-        try:
-            from snowflake.connector import connect
-            try:
-                logger.info("Attempting to use default container service connection")
-                conn = connect(application='BATCH_CONNECTOR')
-                return Session._from_connection(conn)
-            except Exception as container_err:
-                logger.info(f"Container service connection not available: {str(container_err)}")
-        except ImportError:
-            logger.info("snowflake.connector module not available for direct connection")
-            
-        # Fall back to environment variables
-        logger.info("Creating session using environment variables")
-        connection_parameters = {
-            "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
-            "user": os.environ.get("SNOWFLAKE_USER"),
-            "password": os.environ.get("SNOWFLAKE_PASSWORD"),
-            "private_key_path": os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH"),
-            "private_key_passphrase": os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"),
-            "role": os.environ.get("SNOWFLAKE_ROLE", "ACCOUNTADMIN"),
-            "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE"),
-            "database": os.environ.get("SNOWFLAKE_DATABASE"),
-            "schema": os.environ.get("SNOWFLAKE_SCHEMA")
-        }
-        
-        # Filter out None values
-        connection_parameters = {k: v for k, v in connection_parameters.items() if v is not None}
-        
-        if not connection_parameters.get("account") and not (connection_parameters.get("user") or connection_parameters.get("private_key_path")):
-            logger.warning("No account or authentication method specified in environment variables")
-        
-        return Session.builder.configs(connection_parameters).create()
+        # Otherwise, get parameters from environment
+        params = get_connection_params()
+        logger.info(f"Creating session with parameters: {params}")
+        return Session.builder.configs(params).create()
     except Exception as e:
         logger.error(f"Error creating Snowpark session: {str(e)}")
         raise
@@ -340,9 +344,18 @@ def main():
         # Parse command line arguments
         args = parse_arguments()
         
-        # Create Snowflake session
+        # Create Snowflake session using connection parameters if provided, otherwise use environment
         connection_params = json.loads(args.connection_parameters) if args.connection_parameters else None
         session = create_session(connection_params)
+        
+        # Print out current session context information
+        database = session.get_current_database()
+        schema = session.get_current_schema()
+        warehouse = session.get_current_warehouse()
+        role = session.get_current_role()
+        logger.info(
+            f"Connection succeeded. Current session context: database={database}, schema={schema}, warehouse={warehouse}, role={role}"
+        )
         
         # Get the underlying connection
         conn = session._conn._conn
